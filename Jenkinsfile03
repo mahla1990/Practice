@@ -1,0 +1,180 @@
+#!/usr/bin/env groovy
+
+@Library(value="jenkins-ci-library", changelog=false)
+import it.sky.dp.jenkins.slack.*
+
+def slackInfo = ""
+def slackNotifier = ""
+def PROJECT_VERSION = ""
+def GIT_COMMIT = ""
+def DEPLOY_TARGET_ENV = ""
+
+pipeline {
+
+    agent {
+        label 'sky-wsc-test'
+    }
+
+    environment {
+        SLACK_TOKEN_CREDENTIAL_ID = 'bluebird-slack'
+        SLACK_CHANNEL = 'skyita_bluebird_ci'
+        PROJECT_NAME = 'selfcare'
+        DOCKER_BUILD_NAME = 'ita-api-selfcare'
+        DOCKER_RUN_PARAMS = "-v ${WORKSPACE}:/usr/src/project -u jenkins -w /usr/src/project"
+        DOCKER_REGISTRY_URL = 'https://981131884702.dkr.ecr.eu-west-1.amazonaws.com'
+        GIT_CREDENTIALS_ID = "a85c8c78-3cc3-4940-8a25-fd4ec90441a3"
+    }
+
+    options {
+        disableConcurrentBuilds()
+        timeout(time: 20, unit: 'MINUTES')
+        skipDefaultCheckout()
+    }
+
+    parameters {
+        string(name: 'RELEASE_VERSION', defaultValue: '', description: 'Version to be released')
+        string(name: 'ACCESS_RULES_VERSION', defaultValue: '', description: 'Version of the access rules to be released')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        stage('Init') {
+            steps {
+                script {
+                    slackInfo = new SlackInfo("${SLACK_URL}", "${SLACK_TOKEN_CREDENTIAL_ID}", "${SLACK_CHANNEL}")
+                    slackNotifier = new SlackNotifier(this, env, currentBuild, slackInfo)
+                    slackNotifier.notifyBuildStarted()
+
+                    withCredentials([usernamePassword(credentialsId: "jenkins_user_nexus", usernameVariable: 'NEXUS_USERNAME', passwordVariable: 'NEXUS_PASSWORD')]) {
+                        sh(script: "sed -i -e 's/NEXUS_USERNAME/${NEXUS_USERNAME}/g' ./compile/settings.xml")
+                        sh(script: "sed -i -e 's/NEXUS_PASSWORD/${NEXUS_PASSWORD}/g' ./compile/settings.xml")
+                    }
+                    sh("docker build -t ${DOCKER_BUILD_NAME} ./compile")
+
+                    GIT_COMMIT = sh(script: 'git log -n 1 --pretty=format:%h', returnStdout: true)
+
+                    DEPLOY_TARGET_ENV = RELEASE_JOB.equals("true") ? "stage" : "dev"
+                }
+            }
+        }
+        stage('Build') {
+            steps {
+                script {
+                    docker.image(DOCKER_BUILD_NAME).inside(DOCKER_RUN_PARAMS) {
+                        if (RELEASE_JOB.equals("true")) {
+                            def artifact_version = RELEASE_VERSION.split("\\.")[3].trim()
+                            sh "mvn build-helper:parse-version versions:set -DnewVersion=\$\\{parsedVersion.majorVersion}.\$\\{parsedVersion.minorVersion}.\$\\{parsedVersion.incrementalVersion}.\\${artifact_version}.\\${BUILD_NUMBER} && mvn versions:commit"
+                        } else {
+                            sh "mvn build-helper:parse-version versions:set -DnewVersion=\$\\{parsedVersion.majorVersion}.\$\\{parsedVersion.minorVersion}.\$\\{parsedVersion.incrementalVersion}.\\${BUILD_NUMBER} && mvn versions:commit"
+                        }
+                        sh "mvn clean install -U"
+
+                        if (!PULL_REQUEST_JOB.equals("true")) {
+                            if (RELEASE_JOB.equals("true")) {
+                                PROJECT_VERSION = "${RELEASE_VERSION}.${BUILD_NUMBER}"
+                            } else {
+                                sh "echo \$(mvn -q -Dexec.executable=echo -Dexec.args='\${project.version}' --non-recursive exec:exec) > env.properties"
+                                PROJECT_VERSION = sh(script: 'cat env.properties | tr -d \'\\n\'', returnStdout: true)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage('SonarQube') {
+            steps {
+                script {
+                    if (!PULL_REQUEST_JOB.equals("true")) {
+                        docker.image(DOCKER_BUILD_NAME).inside(DOCKER_RUN_PARAMS) {
+                            withSonarQubeEnv('Sonar') {
+                                sh 'mvn sonar:sonar \
+                                    -Dsonar.projectKey=ita-api-selfcare \
+                                    -Dsonar.projectName=Ita-API-Selfcare \
+                                    -Dsonar.host.url=http://sonar.cicd.prod.sky.aws:8080 \
+                                    -Dsonar.login=72b3d7dba2d30d76d380d08ec9f22f6cb2029a98 \
+                                    -Dsonar.junit.reportPaths=target/surefire-reports'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    if (!PULL_REQUEST_JOB.equals("true")) {
+                        sh '$(aws ecr get-login --region eu-west-1 --no-include-email)'
+                        docker.withRegistry("${env.DOCKER_REGISTRY_URL}") {
+                            docker.build("ita-api-${PROJECT_NAME}-dev:${PROJECT_VERSION}", "--label \"revision=${GIT_COMMIT}\" --build-arg WAR_FILE=target/${PROJECT_NAME}-${PROJECT_VERSION}.war .").push()
+                            if (RELEASE_JOB.equals("true")) {
+                                docker.build("ita-api-${PROJECT_NAME}-test:${PROJECT_VERSION}", "--label \"revision=${GIT_COMMIT}\" --build-arg WAR_FILE=target/${PROJECT_NAME}-${PROJECT_VERSION}.war .").push()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage('Swagger') {
+            steps {
+                script {
+                    if (!PULL_REQUEST_JOB.equals("true")) {
+                        dir("enricher") {
+                            git branch: "master", credentialsId: "${GIT_CREDENTIALS_ID}", url: "https://github.com/sky-uk/aws-gateway-swagger-enricher"
+                        }
+                        sh "python enricher/src/sa_enricher.py src/main/swagger/ita-api-${PROJECT_NAME}.yaml swagger.json build/resources/ N --open_api_version=3"
+                        s3Upload(bucket: "ita-api-${PROJECT_NAME}-swaggers", file: "swagger.json", path: "swagger-${PROJECT_VERSION}.json")
+                    }
+                }
+            }
+        }
+        stage('Deploy ECS') {
+            steps {
+                script {
+                    if (!PULL_REQUEST_JOB.equals("true")) {
+                        build job: "ita-api-selfcare_Deploy", parameters: [string(name: 'PROJECT_VERSION', value: "${PROJECT_VERSION}"), string(name: 'TARGET_ENV', value: "${DEPLOY_TARGET_ENV}")], propagate: false, wait: false
+                    }
+                }
+            }
+        }
+        stage('Junit + Jacoco') {
+            steps {
+                script {
+                    junit "target/surefire-reports/*.xml"
+                    jacoco classPattern: 'target/classes', execPattern: 'target/coverage-reports/**.exec'
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo '### DONE'
+            script {
+                currentBuild.displayName = "#${currentBuild.number} / ${PROJECT_VERSION?.trim() ? PROJECT_VERSION.trim() : "N/D"}"
+            }
+            cleanWs()
+        }
+        success {
+            echo '### SUCCESS'
+            script {
+                slackNotifier.notifyBuildSuccess()
+            }
+        }
+        failure {
+            echo '### FAILURE'
+            script {
+                slackNotifier.notifyBuildFailed()
+            }
+        }
+        aborted {
+            echo '### ABORTED'
+            script {
+                slackNotifier.notifyBuildFailed()
+            }
+        }
+    }
+}
